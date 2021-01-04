@@ -8,7 +8,7 @@ from DeepADoTS_master.src.evaluation import Evaluator
 from BA.algorithms.lstm_enc_dec_axl_2 import LSTMED
 from BA.config.ImageMaker import DrawFigure
 from BA.algorithms.update import UPDATE
-
+#
 # read config
 with open("/DeepADoTS_master/src/algorithms/paramter.json", 'r') as load_f:
     load_dict = json.load(load_f)
