@@ -8,11 +8,15 @@ from scipy.stats import multivariate_normal
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 from tqdm import trange
-from .algorithm_utils import Algorithm, PyTorchUtils
-from BA.algorithms import EarlyStopping
+import pdb
+from torch.autograd import Variable
+import torch.nn.functional as F
 
-class LSTMED(Algorithm, PyTorchUtils):
-    def __init__(self, name: str = 'LSTM-ED', num_epochs: int = 20, batch_size: int = 20, lr: float = 1e-3,
+from .algorithm_utils import Algorithm, PyTorchUtils
+
+
+class GRUED(Algorithm, PyTorchUtils):
+    def __init__(self, name: str = 'GRU-ED', num_epochs: int = 10, batch_size: int = 20, lr: float = 1e-3,
                  hidden_size: int = 80, sequence_length: int = 20, train_gaussian_percentage: float = 0.25,
                  n_layers: tuple = (1, 1), use_bias: tuple = (True, True), dropout: tuple = (0, 0),
                  seed: int = None, gpu: int = None, details=True):
@@ -30,16 +34,17 @@ class LSTMED(Algorithm, PyTorchUtils):
         self.use_bias = use_bias
         self.dropout = dropout
 
-        self.lstmed = None
+        self.grued = None
         self.mean, self.cov = None, None
 
-    def fit(self, X: pd.DataFrame):
-        X.interpolate(inplace=True)
-        X.bfill(inplace=True)
-        data = X.values
-        sequences = [data[i:i + self.sequence_length] for i in range(data.shape[0] - self.sequence_length + 1)]
+    def fit(self, X: pd.DataFrame, seq):
+        # X.interpolate(inplace=True)
+        # X.bfill(inplace=True)
+        # data = X.values
         # index = np.arange(0, data.shape[0] - 49, 25, int)
         # sequences = [data[i:i + self.sequence_length] for i in index]
+        #sequences = [data[i:i + self.sequence_length] for i in range(data.shape[0] - self.sequence_length + 1)]
+        sequences = seq
         indices = np.random.permutation(len(sequences))
         split_point = int(self.train_gaussian_percentage * len(sequences))
         train_loader = DataLoader(dataset=sequences, batch_size=self.batch_size, drop_last=True,
@@ -47,44 +52,34 @@ class LSTMED(Algorithm, PyTorchUtils):
         train_gaussian_loader = DataLoader(dataset=sequences, batch_size=self.batch_size, drop_last=True,
                                            sampler=SubsetRandomSampler(indices[-split_point:]), pin_memory=True)
 
-        self.lstmed = LSTMEDModule(X.shape[1], self.hidden_size,
+        self.grued = GRUEDModule(X.shape[1], self.hidden_size,
                                  self.n_layers, self.use_bias, self.dropout,
                                  seed=self.seed, gpu=self.gpu)
-        self.to_device(self.lstmed)
-        optimizer = torch.optim.Adam(self.lstmed.parameters(), lr=self.lr)
-        early_stopping = EarlyStopping()
-        Loss = None
+        self.to_device(self.grued)
+        optimizer = torch.optim.Adam(self.grued.parameters(), lr=self.lr)
 
-        self.lstmed.train()
+        self.grued.train()
         for epoch in trange(self.num_epochs):
             logging.debug(f'Epoch {epoch + 1}/{self.num_epochs}.')
             for ts_batch in train_loader:
-                output = self.lstmed(self.to_var(ts_batch))
+                output = self.grued(self.to_var(ts_batch))
                 loss = nn.MSELoss(size_average=False)(output, self.to_var(ts_batch.float()))
-                self.lstmed.zero_grad()
+                self.grued.zero_grad()
                 loss.backward()
                 optimizer.step()
-                Loss = loss
-            print(Loss)
-            #early_stopping(Loss, self.lstmed)
-        #     if early_stopping.early_stop:
-        #         print("Early stopping")
-        #         # 结束模型训练
-        #         break
-        # self.lstmed.load_state_dict(torch.load('checkpoint.pt'))
 
-
-        self.lstmed.eval()
+        self.grued.eval()
         error_vectors = []
         for ts_batch in train_gaussian_loader:
-            output = self.lstmed(self.to_var(ts_batch))
+            output = self.grued(self.to_var(ts_batch))
             error = nn.L1Loss(reduce=False)(output, self.to_var(ts_batch.float()))
             error_vectors += list(error.view(-1, X.shape[1]).data.cpu().numpy())
 
         self.mean = np.mean(error_vectors, axis=0)
         self.cov = np.cov(error_vectors, rowvar=False)
 
-    def predict(self, X: pd.DataFrame, t=None, model=None):
+
+    def predict(self, X: pd.DataFrame):
         X.interpolate(inplace=True)
         X.bfill(inplace=True)
         data = X.values
@@ -93,27 +88,19 @@ class LSTMED(Algorithm, PyTorchUtils):
         sequences = [data[i:i + self.sequence_length] for i in range(data.shape[0] - self.sequence_length + 1)]
         data_loader = DataLoader(dataset=sequences, batch_size=self.batch_size, shuffle=False, drop_last=False)
 
-        self.lstmed.eval()
+        self.grued.eval()
         mvnormal = multivariate_normal(self.mean, self.cov, allow_singular=True)
         scores = []
         outputs = []
         errors = []
-        t_news = []
         for idx, ts in enumerate(data_loader):
-            output = self.lstmed(self.to_var(ts))
+            output = self.grued(self.to_var(ts))
             error = nn.L1Loss(reduce=False)(output, self.to_var(ts.float()))
             score = -mvnormal.logpdf(error.view(-1, X.shape[1]).data.cpu().numpy())
-            # score = ((error - self.mean).t()) * ((self.cov)**(-1)) * (error - self.mean)
             scores.append(score.reshape(ts.size(0), self.sequence_length))
             if self.details:
                 outputs.append(output.data.numpy())
                 errors.append(error.data.numpy())
-            if t != None:
-                for index, win in enumerate(scores[idx]):
-                    if len(win[win > t]) > (0.75 * self.sequence_length):
-                        print(idx)
-                        print(index)
-                        self.update(X, t, idx, index, model)
 
         # stores seq_len-many scores per timestamp and averages them
         scores = np.concatenate(scores)
@@ -123,6 +110,7 @@ class LSTMED(Algorithm, PyTorchUtils):
         scores = np.nanmean(lattice, axis=0)
 
         if self.details:
+            outputs = outputs[:-1]
             outputs = np.concatenate(outputs)
             lattice = np.full((self.sequence_length, X.shape[0], X.shape[1]), np.nan)
             for i, output in enumerate(outputs):
@@ -139,18 +127,8 @@ class LSTMED(Algorithm, PyTorchUtils):
 
         return scores, errors, outputs
 
-    def update(self, X: pd.DataFrame, t, idx, index, model):
-        model.fit(X[(idx*50 + index):(idx*50 + index + self.sequence_length)])
-        # score, error, ouput = self.predict(X[(idx*50 + index + self.sequence_length):(idx*50 + index + self.sequence_length + 100)])
-        # evaluate = Evaluator()
-        # t_new = evaluate.get_optimal_threshold(y_test=X['label'][(idx*50 + index + self.sequence_length):(idx*50 + index + self.sequence_length + 100)], score=score)
-        # print(t_new)
-        # return t_new
 
-
-
-
-class LSTMEDModule(nn.Module, PyTorchUtils):
+class GRUEDModule(nn.Module, PyTorchUtils):
     def __init__(self, n_features: int, hidden_size: int,
                  n_layers: tuple, use_bias: tuple, dropout: tuple,
                  seed: int, gpu: int):
@@ -163,24 +141,23 @@ class LSTMEDModule(nn.Module, PyTorchUtils):
         self.use_bias = use_bias
         self.dropout = dropout
 
-        self.encoder = nn.LSTM(self.n_features, self.hidden_size, batch_first=True,
+        self.encoder = nn.GRU(self.n_features, self.hidden_size, batch_first=True,
                               num_layers=self.n_layers[0], bias=self.use_bias[0], dropout=self.dropout[0])
         self.to_device(self.encoder)
-        self.decoder = nn.LSTM(self.n_features, self.hidden_size, batch_first=True,
+        self.decoder = nn.GRU(self.n_features, self.hidden_size, batch_first=True,
                               num_layers=self.n_layers[1], bias=self.use_bias[1], dropout=self.dropout[1])
         self.to_device(self.decoder)
         self.hidden2output = nn.Linear(self.hidden_size, self.n_features)
         self.to_device(self.hidden2output)
 
     def _init_hidden(self, batch_size):
-        (self.to_var(torch.Tensor(self.n_layers[0], batch_size, self.hidden_size).zero_()),
-         self.to_var(torch.Tensor(self.n_layers[0], batch_size, self.hidden_size).zero_()))
+        self.to_var(torch.Tensor(self.n_layers[0], batch_size, self.hidden_size).zero_())
 
     def forward(self, ts_batch, return_latent: bool = False):
         batch_size = ts_batch.shape[0]
 
         # 1. Encode the timeseries to make use of the last hidden state.
-        enc_hidden = self._init_hidden(batch_size)  # initialization with zero
+        enc_hidden = self._init_hidden(batch_size) # initialization with zero
         _, enc_hidden = self.encoder(ts_batch.float(), enc_hidden)  # .float() here or .double() for the model
 
         # 2. Use hidden state as initialization for our Decoder-LSTM
@@ -190,13 +167,18 @@ class LSTMEDModule(nn.Module, PyTorchUtils):
         # 4. Reconstruct timeseries backwards
         #    * Use true data for training decoder
         #    * Use hidden2output for prediction
-        output = self.to_var(torch.Tensor(ts_batch.size()).zero_())
+        outputs = self.to_var(torch.Tensor(ts_batch.size()).zero_())
         inputs = self.to_var(torch.Tensor(ts_batch.size()).zero_())
-        for i in reversed(range(ts_batch.shape[1])):
-            output[:, i, :] = self.hidden2output(dec_hidden[0][0, :])
-            if self.training:
-                o, dec_hidden = self.decoder(inputs[:, i].unsqueeze(1).float(), dec_hidden)
-            else:
-                o, dec_hidden = self.decoder(inputs[:, i].unsqueeze(1).float(), dec_hidden)
+        out, dec_hidden = self.decoder(inputs, dec_hidden)
+
+        output = self.hidden2output(out.squeeze(0))
+        # for i in reversed(range(ts_batch.shape[1])):
+        #     outputs[:, i, :] = self.hidden2output(out.squeeze(0))
+        #     if self.training:
+        #         out, dec_hidden = self.decoder(inputs[:, i].unsqueeze(1).float(), dec_hidden)
+        #         out = out.reshape(out.shape[0], -1)
+        #     else:
+        #         out, dec_hidden = self.decoder(inputs[:, i].unsqueeze(1).float(), dec_hidden)
+        #         out = out.reshape(out.shape[0], -1)
 
         return (output, enc_hidden[1][-1]) if return_latent else output
