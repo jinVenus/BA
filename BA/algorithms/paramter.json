@@ -1,0 +1,11 @@
+
+{
+
+  "num_epochs" : 10,
+  "batch_size" : 20,
+  "lr" : 1e-3,
+  "hidden_size" : 80,
+  "sequence_length" : 30,
+  "train_gaussian_percentage" : 0.25
+}
+
