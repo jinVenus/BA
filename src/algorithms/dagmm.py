@@ -14,7 +14,7 @@ from tqdm import trange
 from .algorithm_utils import Algorithm, PyTorchUtils
 from .autoencoder import AutoEncoderModule
 from .gru_enc_dec_axl import GRUEDModule
-from .lstm_enc_dec_axl_2 import LSTMEDModule
+from .lstm_enc_dec_axl import LSTMEDModule
 from .rnn_enc_dec_axl import RNNEDModule
 
 

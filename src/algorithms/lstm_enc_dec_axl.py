@@ -9,11 +9,11 @@ from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 from tqdm import trange
 from .algorithm_utils import Algorithm, PyTorchUtils
-from src.algorithms import EarlyStopping
+
 
 class LSTMED(Algorithm, PyTorchUtils):
     def __init__(self, name: str = 'LSTM-ED', num_epochs: int = 20, batch_size: int = 20, lr: float = 1e-3,
-                 hidden_size: int = 80, sequence_length: int = 20, train_gaussian_percentage: float = 0.25,
+                 hidden_size: int = 50, sequence_length: int = 30, train_gaussian_percentage: float = 0.25,
                  n_layers: tuple = (1, 1), use_bias: tuple = (True, True), dropout: tuple = (0, 0),
                  seed: int = None, gpu: int = None, details=True):
         Algorithm.__init__(self, __name__, name, seed, details=details)
@@ -30,16 +30,14 @@ class LSTMED(Algorithm, PyTorchUtils):
         self.use_bias = use_bias
         self.dropout = dropout
 
+        self.optimizer = None
+        self.mvnormal = None
+
         self.lstmed = None
         self.mean, self.cov = None, None
 
-    def fit(self, X: pd.DataFrame):
-        X.interpolate(inplace=True)
-        X.bfill(inplace=True)
-        data = X.values
-        sequences = [data[i:i + self.sequence_length] for i in range(data.shape[0] - self.sequence_length + 1)]
-        # index = np.arange(0, data.shape[0] - 49, 25, int)
-        # sequences = [data[i:i + self.sequence_length] for i in index]
+    def fit(self, X: pd.DataFrame, seq=None):
+        sequences = seq
         indices = np.random.permutation(len(sequences))
         split_point = int(self.train_gaussian_percentage * len(sequences))
         train_loader = DataLoader(dataset=sequences, batch_size=self.batch_size, drop_last=True,
@@ -48,12 +46,10 @@ class LSTMED(Algorithm, PyTorchUtils):
                                            sampler=SubsetRandomSampler(indices[-split_point:]), pin_memory=True)
 
         self.lstmed = LSTMEDModule(X.shape[1], self.hidden_size,
-                                 self.n_layers, self.use_bias, self.dropout,
-                                 seed=self.seed, gpu=self.gpu)
+                                   self.n_layers, self.use_bias, self.dropout,
+                                   seed=self.seed, gpu=self.gpu)
         self.to_device(self.lstmed)
-        optimizer = torch.optim.Adam(self.lstmed.parameters(), lr=self.lr)
-        early_stopping = EarlyStopping()
-        Loss = None
+        self.optimizer = torch.optim.Adam(self.lstmed.parameters(), lr=self.lr)
 
         self.lstmed.train()
         for epoch in trange(self.num_epochs):
@@ -63,16 +59,7 @@ class LSTMED(Algorithm, PyTorchUtils):
                 loss = nn.MSELoss(size_average=False)(output, self.to_var(ts_batch.float()))
                 self.lstmed.zero_grad()
                 loss.backward()
-                optimizer.step()
-                Loss = loss
-            print(Loss)
-            #early_stopping(Loss, self.lstmed)
-        #     if early_stopping.early_stop:
-        #         print("Early stopping")
-        #         # 结束模型训练
-        #         break
-        # self.lstmed.load_state_dict(torch.load('checkpoint.pt'))
-
+                self.optimizer.step()
 
         self.lstmed.eval()
         error_vectors = []
@@ -84,21 +71,31 @@ class LSTMED(Algorithm, PyTorchUtils):
         self.mean = np.mean(error_vectors, axis=0)
         self.cov = np.cov(error_vectors, rowvar=False)
 
-    def predict(self, X: pd.DataFrame, t=None, model=None):
-        X.interpolate(inplace=True)
-        X.bfill(inplace=True)
-        data = X.values
-        # index = np.arange(0, data.shape[0] - 49, 25, int)
-        # sequences = [data[i:i + self.sequence_length] for i in index]
-        sequences = [data[i:i + self.sequence_length] for i in range(data.shape[0] - self.sequence_length + 1)]
-        data_loader = DataLoader(dataset=sequences, batch_size=self.batch_size, shuffle=False, drop_last=False)
+        return self.mean, self.cov
+
+
+    def predict(self, X: pd.DataFrame, seq = None, update = None, t = None, data = None):
+        self.t = t
+        if update:
+            X.interpolate(inplace=True)
+            X.bfill(inplace=True)
+            data = X.values
+            # index = np.arange(0, data.shape[0] - 29, 30, int)
+            # sequences = [data[i:i + self.sequence_length] for i in index]
+            sequences = [data[i:i + self.sequence_length] for i in range(data.shape[0] - self.sequence_length + 1)]
+            data_loader = DataLoader(dataset=sequences, batch_size=self.batch_size, shuffle=False, drop_last=False)
+        else:
+            sequences = seq
+            data_loader = DataLoader(dataset=sequences, batch_size=self.batch_size, shuffle=False, drop_last=False)
+
 
         self.lstmed.eval()
         mvnormal = multivariate_normal(self.mean, self.cov, allow_singular=True)
         scores = []
         outputs = []
         errors = []
-        t_news = []
+        # buffer = []
+        # new_label = np.zeros(3000)
         for idx, ts in enumerate(data_loader):
             output = self.lstmed(self.to_var(ts))
             error = nn.L1Loss(reduce=False)(output, self.to_var(ts.float()))
@@ -108,12 +105,24 @@ class LSTMED(Algorithm, PyTorchUtils):
             if self.details:
                 outputs.append(output.data.numpy())
                 errors.append(error.data.numpy())
-            if t != None:
-                for index, win in enumerate(scores[idx]):
-                    if len(win[win > t]) > (0.75 * self.sequence_length):
-                        print(idx)
-                        print(index)
-                        self.update(X, t, idx, index, model)
+            # if self.t != None :
+            #     point = scores[idx]
+            #     for index, ascore in enumerate(point):
+            #         for sscore in ascore:
+            #             if sscore >= 0.75 * self.t:
+            #                 buffer.append(data[(idx * self.batch_size)+index])
+            #             # if ascore > t:
+            #             #      new_label[idx+index] = 1
+            #             if len(buffer) == 2000:
+            #                 buffer = pd.DataFrame(buffer)
+            #                 for i in range(30):
+            #                     new_label[1970+i] = 1
+            #                 upd = UPDATE()
+            #                 self.t = upd.update(buffer[:1000], buffer[1000:], new_label, model)
+            #                 buffer = []
+            #                 new_label = np.zeros(3000)
+
+
 
         # stores seq_len-many scores per timestamp and averages them
         scores = np.concatenate(scores)
@@ -138,16 +147,6 @@ class LSTMED(Algorithm, PyTorchUtils):
             errors = np.nanmean(lattice, axis=0)
 
         return scores, errors, outputs
-
-    def update(self, X: pd.DataFrame, t, idx, index, model):
-        model.fit(X[(idx*50 + index):(idx*50 + index + self.sequence_length)])
-        # score, error, ouput = self.predict(X[(idx*50 + index + self.sequence_length):(idx*50 + index + self.sequence_length + 100)])
-        # evaluate = Evaluator()
-        # t_new = evaluate.get_optimal_threshold(y_test=X['label'][(idx*50 + index + self.sequence_length):(idx*50 + index + self.sequence_length + 100)], score=score)
-        # print(t_new)
-        # return t_new
-
-
 
 
 class LSTMEDModule(nn.Module, PyTorchUtils):
