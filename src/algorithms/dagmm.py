@@ -26,7 +26,7 @@ class DAGMM(Algorithm, PyTorchUtils):
         RNN = RNNEDModule
 
     def __init__(self, num_epochs=10, lambda_energy=0.1, lambda_cov_diag=0.005, lr=1e-3, batch_size=50, gmm_k=3,
-                 normal_percentile=80, sequence_length=30, autoencoder_type=AutoEncoderModule, autoencoder_args=None,
+                 normal_percentile=80, sequence_length=30, autoencoder_type=LSTMEDModule, autoencoder_args=None,
                  hidden_size: int = 5, seed: int = None, gpu: int = None, details=True):
         _name = 'LSTM-DAGMM' if autoencoder_type == LSTMEDModule else 'DAGMM'
         Algorithm.__init__(self, __name__, _name, seed, details=details)
@@ -75,7 +75,7 @@ class DAGMM(Algorithm, PyTorchUtils):
         # X.interpolate(inplace=True)
         # X.bfill(inplace=True)
         # data = X.values
-        #sequences = [data[i:i + self.sequence_length] for i in range(X.shape[0] - self.sequence_length + 1)]
+        # sequences = [data[i:i + self.sequence_length] for i in range(X.shape[0] - self.sequence_length + 1)]
         sequences = seq
         data_loader = DataLoader(dataset=sequences, batch_size=self.batch_size, shuffle=True, drop_last=True)
         self.hidden_size = 5 + int(X.shape[1] / 20)
@@ -108,15 +108,23 @@ class DAGMM(Algorithm, PyTorchUtils):
 
             n += input_data.size(0)
 
-    def predict(self, X: pd.DataFrame):
+    def predict(self, X: pd.DataFrame, seq=None, update=None, t=None, data=None):
         """Using the learned mixture probability, mean and covariance for each component k, compute the energy on the
         given data."""
+        self.t = t
         self.dagmm.eval()
-        X.interpolate(inplace=True)
-        X.bfill(inplace=True)
-        data = X.values
-        sequences = [data[i:i + self.sequence_length] for i in range(len(data) - self.sequence_length + 1)]
-        data_loader = DataLoader(dataset=sequences, batch_size=1, shuffle=False)
+        if update:
+            # X.interpolate(inplace=True)
+            # X.bfill(inplace=True)
+            # data = X.values
+            data = X
+            index = np.arange(0, data.shape[0] - self.sequence_length + 1, 25, int)
+            sequences = [data[i:i + self.sequence_length] for i in index]
+            data_loader = DataLoader(dataset=sequences, batch_size=1, shuffle=False)
+        else:
+            sequences = seq
+            data_loader = DataLoader(dataset=sequences, batch_size=1, shuffle=False)
+
         test_energy = np.full((self.sequence_length, X.shape[0]), np.nan)
 
         encodings = np.full((self.sequence_length, X.shape[0], self.hidden_size), np.nan)
@@ -127,7 +135,7 @@ class DAGMM(Algorithm, PyTorchUtils):
         for i, sequence in enumerate(data_loader):
             enc, dec, z, gamma = self.dagmm(self.to_var(sequence).float())
             sample_energy, _ = self.dagmm.compute_energy(z, size_average=False)
-            idx = (i % self.sequence_length, np.arange(i, i + self.sequence_length))
+            idx = (i % self.sequence_length, np.arange(i * 25, i * 25 + self.sequence_length))
             test_energy[idx] = sample_energy.data.numpy()
 
             if self.details:
@@ -144,7 +152,7 @@ class DAGMM(Algorithm, PyTorchUtils):
             self.prediction_details.update({'euclidean_errors_mean': np.nanmean(euc_errors, axis=0)})
             self.prediction_details.update({'cosine_errors_mean': np.nanmean(csn_errors, axis=0)})
 
-        return test_energy
+        return test_energy, z
 
 
 class DAGMMModule(nn.Module, PyTorchUtils):
